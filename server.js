@@ -31,7 +31,7 @@ const srv = http.createServer((q, s) => {
 
 /* --- وب‌سوکت ساده (بدون کتابخونه) --- */
 function wsSend(s, t) {
-  if (s.destroyed) return;
+  if (!s || s.destroyed) return;
   const p = Buffer.from(t), n = p.length; let h;
   if (n < 126) h = Buffer.from([0x81, n]);
   else if (n < 65536) { h = Buffer.alloc(4); h[0] = 0x81; h[1] = 126; h.writeUInt16BE(n, 2); }
@@ -45,23 +45,34 @@ function parse(b) {
   else if (len === 127) { if (b.length < 10) return null; len = Number(b.readBigUInt64BE(2)); off = 10; }
   const masked = b[1] & 128; if (masked) off += 4;
   if (b.length < off + len) return null;
-  let p = Buffer.from(b.slice(off, off + len));
+  const p = Buffer.from(b.slice(off, off + len));
   if (masked) { const m = b.slice(off - 4, off); for (let i = 0; i < p.length; i++) p[i] ^= m[i % 4]; }
   return { op, text: p.toString('utf8'), len: off + len };
 }
 
-const rooms = new Map(); // کد اتاق -> [سوکت‌ها]
+/* --- اتاق‌ها: تا ۴ بازیکن. هر پیام بدون تغییر برای همه‌ی بقیه‌ی اتاق فرستاده می‌شه (بازی خودش شناسه بازیکن‌ها رو مدیریت می‌کنه) --- */
+const rooms = new Map(); // کد اتاق -> { host, socks:Set, max }
 srv.on('upgrade', (q, sock) => {
   const url = new URL(q.url, 'http://x'), key = q.headers['sec-websocket-key'];
   if (url.pathname !== '/ws' || !key) return sock.destroy();
   sock.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' +
     crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64') + '\r\n\r\n');
   sock.setNoDelay(true);
+  sock.on('error', () => {});
   const code = (url.searchParams.get('room') || '').slice(0, 8), mode = url.searchParams.get('mode');
+  const max = Math.min(4, Math.max(2, +url.searchParams.get('max') || 2));
   const reject = why => { wsSend(sock, JSON.stringify({ __: why })); sock.end(); };
   let room = rooms.get(code);
-  if (mode === 'host') { if (room) return reject('taken'); room = [sock]; rooms.set(code, room); }
-  else { if (!room || room.length !== 1) return reject('nope'); room.push(sock); room.forEach(x => wsSend(x, '{"__":"peer"}')); }
+  if (mode === 'host') {
+    if (room) return reject('taken');
+    room = { host: sock, socks: new Set([sock]), max };
+    rooms.set(code, room);
+  } else {
+    if (!room) return reject('nope');
+    if (room.socks.size >= room.max) return reject('full');
+    room.socks.add(sock);
+  }
+  wsSend(sock, '{"__":"ok"}');
 
   let buf = Buffer.alloc(0);
   sock.on('data', d => {
@@ -70,16 +81,16 @@ srv.on('upgrade', (q, sock) => {
     while ((f = parse(buf))) {
       buf = buf.slice(f.len);
       if (f.op === 8) { sock.end(); return; }
-      if (f.op === 1) { const r = rooms.get(code); if (r) r.forEach(x => { if (x !== sock) wsSend(x, f.text); }); }
+      if (f.op === 1) room.socks.forEach(x => { if (x !== sock) wsSend(x, f.text); });
     }
   });
-  const gone = () => {
-    const r = rooms.get(code);
-    if (!r || !r.includes(sock)) return;
-    rooms.delete(code);
-    r.forEach(x => { if (x !== sock) { wsSend(x, '{"__":"left"}'); x.end(); } });
-  };
-  sock.on('close', gone); sock.on('error', gone);
+  sock.on('close', () => {
+    if (!room.socks.delete(sock)) return;
+    if (sock === room.host) {               // میزبان رفت: اتاق بسته می‌شه
+      room.socks.forEach(x => x.end());
+      if (rooms.get(code) === room) rooms.delete(code);
+    } else if (rooms.get(code) === room && room.socks.size === 0) rooms.delete(code);
+  });
 });
 
 ensureLib(() => srv.listen(PORT, '0.0.0.0', () => {
